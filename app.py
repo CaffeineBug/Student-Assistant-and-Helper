@@ -10,6 +10,7 @@ from agents.reasoning_planner import ReasoningPlannerAgent
 from agents.retriever import RetrieverAgent
 import uuid
 from rapidfuzz import fuzz
+import json
 
 # Load environment variables
 load_dotenv()
@@ -66,6 +67,8 @@ def initialize_session_state():
         st.session_state.chat_history = []
     if 'documents' not in st.session_state:
         st.session_state.documents = []
+    if 'feedback_log_path' not in st.session_state:
+        st.session_state.feedback_log_path = "feedback_log.jsonl"
 
 def check_api_keys():
     """Check if all required API keys are available"""
@@ -277,6 +280,20 @@ def main():
                             "force_reasoning": force_reasoning,
                         }
                         reasoning_result = reasoning_agent.process_query(query, reasoning_context)
+
+                        # Check for feedback on the last answer to improve the current one
+                        if st.session_state.chat_history:
+                            last_chat = st.session_state.chat_history[-1]
+                            if last_chat.get("feedback_score") is not None:
+                                feedback_context = {
+                                    "previous_query": last_chat.get("query"),
+                                    "previous_answer": last_chat.get("answer"),
+                                    "feedback_score": last_chat.get("feedback_score"),
+                                    "feedback_comment": last_chat.get("feedback_comment", "")
+                                }
+                                # Pass this feedback to the agent for the new query
+                                reasoning_context["user_feedback"] = feedback_context
+
                         top_context = reasoning_result.get("context", {}).get("retrieved_chunks", [])
                         if not top_context:
                             status_box.update(label="No relevant context found.", state="error")
@@ -287,7 +304,9 @@ def main():
                                 "answer": "No relevant context was found in the uploaded document for your question.",
                                 "sources": [],
                                 "reasoning_required": False,
-                                "reasoning_chain": []
+                                "reasoning_chain": [],
+                                "feedback_score": None,
+                                "feedback_comment": None
                             }
                             st.session_state.chat_history.append(chat_entry)
                             st.rerun()
@@ -315,13 +334,22 @@ def main():
                                 for i, step in enumerate(reasoning_steps, 1):
                                     answer += f"{i}. {step}\n"
                             # Annotate with context count
+                            sources = []
+                            for chunk in top_context:
+                                sources.append({
+                                    "chunk_number": chunk.get("chunk_number"),
+                                    "score": chunk.get("final_score"),
+                                    "preview": chunk.get("text", "")[:200] + "..."
+                                })
                             header = f"(Relevant context found: {len(top_context)} chunks)\n\n"
-                            result = {"answer": header + answer, "sources": [chunk.get('source', '') for chunk in top_context]}
+                            result = {"answer": header + answer, "sources": sources}
                         else:
                             # Fall back to simple QA for straightforward questions
                             base = llm_client.answer_question(query, top_context)
                             header = f"(Relevant context found: {len(top_context)} chunks)\n\n"
-                            result = {"answer": header + base.get("answer", ""), "sources": base.get("sources", [])}
+                            # The 'sources' from answer_question are already in the correct format
+                            result = {"answer": header + base.get("answer", ""), 
+                                      "sources": base.get("sources", [])}
 
                         # Done
                         status_box.update(label="Done ✅", state="complete")
@@ -332,7 +360,10 @@ def main():
                             "answer": result["answer"],
                             "sources": result["sources"],
                             "reasoning_required": reasoning_result.get("reasoning_required", False),
-                            "reasoning_chain": reasoning_result.get("reasoning_chain", [])
+                            "reasoning_chain": reasoning_result.get("reasoning_chain", []),
+                            "reflection_critique": reasoning_result.get("reflection_critique"),
+                            "feedback_score": None, # Initialize feedback fields
+                            "feedback_comment": None
                         }
                         st.session_state.chat_history.append(chat_entry)
                         st.rerun()
@@ -343,8 +374,10 @@ def main():
             if st.session_state.chat_history:
                 st.markdown('<h3 class="section-header">💭 Conversation History</h3>', unsafe_allow_html=True)
                 
-                for i, chat in enumerate(reversed(st.session_state.chat_history)):
-                    with st.expander(f"Q: {chat['query'][:100]}...", expanded=(i == 0)):
+                # Iterate over a mutable copy of the list indices for safe modification
+                for i in range(len(st.session_state.chat_history) - 1, -1, -1):
+                    chat = st.session_state.chat_history[i]
+                    with st.expander(f"Q: {chat['query'][:100]}...", expanded=(i == len(st.session_state.chat_history) - 1)):
                         st.markdown(f"**Question:** {chat['query']}")
                         
                         # Show reasoning chain in a separate expander
@@ -355,6 +388,12 @@ def main():
                                 for j, step in enumerate(chat['reasoning_chain'], 1):
                                     st.markdown(f"**Step {j}:** {step}")
                                 st.markdown("---")
+
+                        # Show reflection critique if available
+                        if chat.get('reflection_critique'):
+                            with st.expander("🔬 View Reflection", expanded=False):
+                                st.markdown("### 🔬 Reflection & Refinement")
+                                st.markdown(chat['reflection_critique'])
                         
                         # Show the final answer in a clean format
                         st.markdown("### 💬 Final Answer")
@@ -364,9 +403,50 @@ def main():
                         if chat.get('sources'):
                             with st.expander("📝 View Sources", expanded=False):
                                 st.markdown("**Sources used in this response:**")
-                                for source in chat['sources']:
-                                    if source:  # Only show non-empty sources
-                                        st.markdown(f"- {source}")
+                                for i, source in enumerate(chat['sources'], 1):
+                                    if isinstance(source, dict):
+                                        st.markdown(
+                                            f"**{i}. Chunk {source.get('chunk_number', '?')}** (Score: {source.get('score', 0.0):.3f})\n"
+                                            f"> {source.get('preview', 'N/A')}"
+                                        )
+                        
+                        # --- User Feedback Section ---
+                        st.markdown("---")
+                        st.write("**Was this answer helpful?**")
+                        
+                        feedback_cols = st.columns([1, 1, 1, 8])
+                        
+                        # Thumbs up
+                        if feedback_cols[0].button("👍", key=f"up_{i}", help="Good answer"):
+                            st.session_state.chat_history[i]['feedback_score'] = 1
+                            st.toast("Thanks for your feedback! 👍")
+                            st.rerun()
+
+                        # Thumbs down
+                        if feedback_cols[1].button("👎", key=f"down_{i}", help="Bad answer"):
+                            st.session_state.chat_history[i]['feedback_score'] = -1
+                            st.toast("Thanks for your feedback! 👎")
+                            st.rerun()
+
+                        # Display current feedback state
+                        # Add a check to prevent IndexError on rerun
+                        if i < len(st.session_state.chat_history):
+                            score = st.session_state.chat_history[i].get('feedback_score')
+                            if score == 1:
+                                feedback_cols[2].markdown("✅ Liked")
+                            elif score == -1:
+                                feedback_cols[2].markdown("❌ Disliked")
+
+                        comment = st.text_area("Additional feedback (optional):", key=f"comment_{i}", height=50)
+                        if st.button("Submit Feedback", key=f"submit_feedback_{i}"):
+                            st.session_state.chat_history[i]['feedback_comment'] = comment
+                            # Log feedback to a file
+                            with open(st.session_state.feedback_log_path, "a") as f:
+                                log_entry = chat.copy()
+                                log_entry['feedback_comment'] = comment
+                                f.write(json.dumps(log_entry) + "\n")
+                            st.toast("Feedback submitted and logged!")
+                            st.rerun()
     
     with col2:
         st.markdown('<h2 class="section-header">📊 Document Info</h2>', unsafe_allow_html=True)

@@ -2,6 +2,7 @@ import json
 from typing import Dict, List, Any, Optional
 import google.generativeai as genai
 from langgraph.graph import StateGraph, END
+from .feedback_reflection import FeedbackAndReflectionAgent
 
 class ReasoningPlannerAgent:
     """
@@ -16,6 +17,7 @@ class ReasoningPlannerAgent:
         self.gemini_api_key = gemini_api_key
         self.model_name = model_name
         self.retriever_agent = retriever_agent
+        self.reflection_agent = FeedbackAndReflectionAgent(gemini_api_key, model_name)
         self._model = None
         self._graph = None
         self._initialize_llm()
@@ -31,6 +33,7 @@ class ReasoningPlannerAgent:
         return {
             "query": query,
             "context": context or {},
+            "initial_answer": None,
             "reasoning_steps": [],
             "retrieval_plan": [],
             "final_answer": None,
@@ -39,12 +42,25 @@ class ReasoningPlannerAgent:
 
     def _analyze_query_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze the query and plan the reasoning approach."""
+        user_feedback_prompt = ""
+        feedback = state.get("context", {}).get("user_feedback")
+        if feedback:
+            user_feedback_prompt = f"""
+            IMPORTANT: The user provided feedback on the previous answer. Take this into account.
+            - Previous Query: {feedback.get('previous_query')}
+            - Previous Answer: {feedback.get('previous_answer')}
+            - User Feedback Score: {'👍 (Good)' if feedback.get('feedback_score') == 1 else '👎 (Bad)'}
+            - User Comment: {feedback.get('feedback_comment', 'N/A')}
+            
+            Based on this feedback, refine your plan to address the user's concerns for the NEW query.
+            """
+
         prompt = """
         You are a reasoning and planning assistant. Your task is to analyze the user's query and plan how to answer it.
         
         For the given query, please:
         1. Identify the key information needed
-        2. Determine if multi-step reasoning is required
+        2. Determine if multi-step reasoning is required (e.g., for complex, comparative, or multi-part questions)
         3. Plan the retrieval strategy
         4. Outline the reasoning steps
         
@@ -55,7 +71,10 @@ class ReasoningPlannerAgent:
         - "retrieval_plan": list of information to retrieve
         - "reasoning_steps": list of steps to solve the problem
         - "expected_answer_format": description of the expected answer format
-        """.format(query=state["query"])
+        """.format(
+            query=state["query"],
+            user_feedback=user_feedback_prompt
+        )
 
         response = self._get_llm_response(prompt)
         plan = response.get("plan", {})
@@ -132,10 +151,28 @@ class ReasoningPlannerAgent:
         response = self._get_llm_response(prompt)
         
         if isinstance(response, dict):
-            state["final_answer"] = response.get("answer")
+            # This is the first draft, so store it as the initial answer
+            state["initial_answer"] = response.get("answer")
             state["confidence"] = response.get("confidence", 0.5)
             state["reasoning_chain"] = response.get("reasoning_chain", [])
         
+        return state
+
+    def _reflect_and_refine_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Use the reflection agent to critique and refine the answer."""
+        if not state.get("initial_answer"):
+            return state # Nothing to reflect on
+
+        reflection = self.reflection_agent.reflect_on_answer(
+            query=state["query"],
+            context=state.get("context", {}),
+            initial_answer=state["initial_answer"]
+        )
+
+        # Update the final answer with the improved one
+        state["final_answer"] = reflection.get("improved_answer", state["initial_answer"])
+        # Optionally store critique for logging/debugging
+        state["reflection_critique"] = reflection.get("critique")
         return state
 
     def _get_llm_response(self, prompt: str) -> Dict:
@@ -163,11 +200,13 @@ class ReasoningPlannerAgent:
         workflow.add_node("analyze_query", self._analyze_query_node)
         workflow.add_node("execute_retrieval", self._execute_retrieval_node)
         workflow.add_node("perform_reasoning", self._reasoning_node)
+        workflow.add_node("reflect_and_refine", self._reflect_and_refine_node)
         
         # Define edges
         workflow.add_edge("analyze_query", "execute_retrieval")
         workflow.add_conditional_edges(
             "execute_retrieval",
+            # After retrieval, decide if we need to reason or can end.
             lambda state: "perform_reasoning" if state.get("reasoning_required") else END,
             {
                 "perform_reasoning": "perform_reasoning",
@@ -175,7 +214,9 @@ class ReasoningPlannerAgent:
             }
         )
         workflow.add_edge("perform_reasoning", END)
-        
+        # The reflection node should follow the reasoning node
+        workflow.add_edge("perform_reasoning", "reflect_and_refine")
+        workflow.add_edge("reflect_and_refine", END)
         # Set entry point
         workflow.set_entry_point("analyze_query")
         
